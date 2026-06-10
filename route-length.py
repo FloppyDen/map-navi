@@ -11,6 +11,21 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 
+# Настройка OSMnx для работы с локальным кешем
+ox.settings.use_cache = True
+ox.settings.cache_folder = os.path.join(os.path.dirname(__file__), "cache")
+ox.settings.log_console = False
+
+CSV_PATH = os.path.join(os.path.dirname(__file__), 'spb_road_network_base.csv')
+
+
+def load_osm_graph(place='Saint Petersburg, Russia'):
+    G = ox.graph_from_place(place, network_type='drive')
+    G = ox.add_edge_speeds(G)
+    G = ox.add_edge_travel_times(G)
+    return G
+
+
 # ==========================================
 # ЧАСТЬ 1: ЗАГРУЗКА ДАННЫХ И ОБУЧЕНИЕ МОДЕЛИ
 # ==========================================
@@ -64,20 +79,17 @@ def find_k_shortest_paths(G, model, features, start_coord, end_coord, k=3):
     
     # Функция веса для алгоритма поиска: предсказанное время проезда по ребру
     def weight_func(u, v, data):
-        # Создаем DataFrame из одного ребра для предсказания
-        # Берем среднее значение hour = 18 (вечерний час пик для демонстрации)
         edge_data = pd.DataFrame([{
             'length': data.get('length', 100),
             'speed_kph': data.get('speed_kph', 40),
             'hour': 18 
         }])
         predicted_time = model.predict(edge_data[features])[0]
-        return max(predicted_time, 1) # Вес должен быть строго положительным
+        return max(predicted_time, 1)
 
     print(f"Поиск {k} альтернативных маршрутов...")
     routes = []
     try:
-        # nx.shortest_simple_paths реализует алгоритм Йена для поиска K кратчайших путей
         path_generator = nx.shortest_simple_paths(G, start_node, end_node, weight=weight_func)
         
         for _ in range(k):
@@ -88,6 +100,19 @@ def find_k_shortest_paths(G, model, features, start_coord, end_coord, k=3):
         return []
         
     return routes
+
+
+def load_model_with_dataset(csv_path=None):
+    if csv_path is None:
+        csv_path = CSV_PATH
+    return prepare_and_train_model(csv_path)
+
+
+def get_route(G, model, features, start_coord, end_coord):
+    routes = find_k_shortest_paths(G, model, features, start_coord, end_coord, k=1)
+    if not routes:
+        return None
+    return routes[0]
 
 # ==========================================
 # ЧАСТЬ 3: ГРАФИЧЕСКИЙ ИНТЕРФЕЙС И ВИЗУАЛИЗАЦИЯ
@@ -190,29 +215,35 @@ class RoutingApp:
 if __name__ == "__main__":
     print("Инициализация системы...")
     
-    # 1. Загружаем граф (используем кэш OSMnx, если он был создан ранее)
+    # 1. Загружаем граф (используем локальный кеш OSMnx, если он был создан ранее)
     print("Загрузка графа Санкт-Петербурга...")
-    G = ox.graph_from_place('Saint Petersburg, Russia', network_type='drive')
-    G = ox.add_edge_speeds(G)
-    G = ox.add_edge_travel_times(G)
+    try:
+        G = ox.graph_from_place('Saint Petersburg, Russia', network_type='drive')
+        G = ox.add_edge_speeds(G)
+        G = ox.add_edge_travel_times(G)
+    except Exception as e:
+        print("Не удалось загрузить граф из OSMnx cache:", e)
+        raise RuntimeError("Проверьте локальный кеш в папке cache/ и повторите запуск.") from e
     
-    # 2. Если у вас уже есть сохраненный CSV, раскомментируйте следующую строку:
-    # model, df, features = prepare_and_train_model('spb_road_network_base.csv')
-    
-    # Для демонстрации создадим синтетический датасет прямо из графа G
-    edges_gdf = ox.graph_to_gdfs(G, nodes=False, edges=True)
-    df_demo = edges_gdf[['length', 'speed_kph', 'travel_time']].reset_index(drop=True)
-    df_demo['hour'] = np.random.randint(0, 24, size=len(df_demo))
-    rush_hour_multiplier = np.where((df_demo['hour'] >= 8) & (df_demo['hour'] <= 10) | (df_demo['hour'] >= 17) & (df_demo['hour'] <= 19), 1.6, 1.1)
-    df_demo['actual_time'] = df_demo['travel_time'] * rush_hour_multiplier * np.random.normal(1.0, 0.15, size=len(df_demo))
-    
-    features = ['length', 'speed_kph', 'hour']
-    X = df_demo[features]
-    y = df_demo['actual_time']
-    
-    model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
-    model.fit(X, y)
-    print("Модель успешно обучена на синтетических данных графа.")
+    # 2. Обучение модели на локальном CSV, если он есть.
+    csv_path = os.path.join(os.path.dirname(__file__), 'spb_road_network_base.csv')
+    if os.path.exists(csv_path):
+        model, df_demo, features = prepare_and_train_model(csv_path)
+    else:
+        print("Локальный CSV spb_road_network_base.csv не найден. Используется синтетический набор данных из графа.")
+        edges_gdf = ox.graph_to_gdfs(G, nodes=False, edges=True)
+        df_demo = edges_gdf[['length', 'speed_kph', 'travel_time']].reset_index(drop=True)
+        df_demo['hour'] = np.random.randint(0, 24, size=len(df_demo))
+        rush_hour_multiplier = np.where((df_demo['hour'] >= 8) & (df_demo['hour'] <= 10) | (df_demo['hour'] >= 17) & (df_demo['hour'] <= 19), 1.6, 1.1)
+        df_demo['actual_time'] = df_demo['travel_time'] * rush_hour_multiplier * np.random.normal(1.0, 0.15, size=len(df_demo))
+        
+        features = ['length', 'speed_kph', 'hour']
+        X = df_demo[features]
+        y = df_demo['actual_time']
+        
+        model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+        model.fit(X, y)
+        print("Модель успешно обучена на синтетических данных графа.")
     
     # 3. Запуск графического интерфейса
     root = tk.Tk()
